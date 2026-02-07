@@ -2,7 +2,9 @@ fastapi
 uvicorn
 motor
 pydantic
+bcrypt==4.0.1
 passlib[bcrypt]
 python-jose[cryptography]
 python-multipart
 email-validator
+gunicorn
