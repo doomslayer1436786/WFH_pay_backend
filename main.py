@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+from fastapi.middleware.cors import CORSMiddleware
 
 import os
 # ... other imports
@@ -24,6 +25,13 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 client = AsyncIOMotorClient(MONGO_DETAILS)
 db = client.food_ordering_db
 restaurant_collection = db.get_collection("restaurants")
