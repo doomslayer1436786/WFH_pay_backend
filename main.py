@@ -1,63 +1,77 @@
+import os
 from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 from typing import List, Optional
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from fastapi.middleware.cors import CORSMiddleware
-
-import os
-# ... other imports
 
 # --- CONFIGURATION & SECURITY ---
-# Update this line:
-MONGO_DETAILS = "mongodb+srv://kaiftokare19:Kaif%40786@wfhcafe-development.8zgicnw.mongodb.net/?appName=WFHCafe-Development" 
-SECRET_KEY = "supersecretkey"
-# --- CONFIGURATION & SECURITY ---
+# Get secrets from Environment Variables (Set these in Render Dashboard)
+MONGO_DETAILS = "mongodb+srv://kaiftokare19:Kaif%40786@wfhcafe-development.8zgicnw.mongodb.net/?appName=WFHCafe-Development"
+SECRET_KEY = "supersecretkey" # Fallback only for local testing
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
 
 # Auth Helpers
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 app = FastAPI()
+
+# --- CORS MIDDLEWARE (Fixes "Failed to fetch") ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],  # Allows all origins (React, Mobile, etc.)
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],  # Allows GET, POST, PUT, DELETE, etc.
+    allow_headers=["*"],
 )
+
+# --- DATABASE CONNECTION ---
 client = AsyncIOMotorClient(MONGO_DETAILS)
 db = client.food_ordering_db
 restaurant_collection = db.get_collection("restaurants")
 user_collection = db.get_collection("users")
+bill_collection = db.get_collection("bills")
 
 # --- DATA MODELS ---
-class UpdateItemRequest(BaseModel):
-    new_name: Optional[str] = None
-    new_price: Optional[float] = None
 
 # 1. User Models
 class UserSignup(BaseModel):
     username: str
     password: str
+    restaurant_name: str
+    restaurant_id: str  # Unique ID chosen by user at signup
 
-class UserInDB(BaseModel):
+class UserLogin(BaseModel):
     username: str
-    hashed_password: str
-    
+    password: str
+
+# 2. Restaurant Models
+class MenuItem(BaseModel):
+    name: str
+    price: float
+
+class UpdateItemRequest(BaseModel):
+    new_name: Optional[str] = None
+    new_price: Optional[float] = None
+
+class BulkAddRequest(BaseModel):
+    # No restaurant_id here (Server finds it automatically)
+    items: List[MenuItem]
+
+# 3. Bill Models
 class BillItem(BaseModel):
     name: str
     quantity: int
     price: float
 
 class SaveBillRequest(BaseModel):
-    restaurant_id: str
+    # No restaurant_id here
     items: List[BillItem]
     subtotal: float
     tax_amount: float
@@ -66,15 +80,6 @@ class SaveBillRequest(BaseModel):
     grand_total: float
     payment_method: str = "UPI"
     customer_note: Optional[str] = None
-
-# 2. Restaurant Models
-class MenuItem(BaseModel):
-    name: str
-    price: float
-
-class BulkAddRequest(BaseModel):
-    restaurant_id: str
-    items: List[MenuItem]
 
 # --- SECURITY FUNCTIONS ---
 
@@ -89,50 +94,10 @@ def create_access_token(data: dict):
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-@app.put("/restaurants/{restaurant_id}/items/{original_name}")
-async def update_menu_item(
-    restaurant_id: str, 
-    original_name: str, 
-    update_data: UpdateItemRequest,
-):
-    """
-    Updates a specific item in the menu array.
-    """
-    # 1. Verify Ownership (Optional but recommended)
-    # check_ownership(restaurant_id, current_user)
 
-    # 2. Build the update query
-    # We use "dot notation" with the positional operator $ 
-    # 'menu.$.price' means "update the price of the matched item in the array"
-    
-    set_fields = {"last_updated": datetime.utcnow()}
-    
-    if update_data.new_price is not None:
-        set_fields["menu.$.price"] = update_data.new_price
-        
-    if update_data.new_name is not None:
-        set_fields["menu.$.name"] = update_data.new_name
-
-    # 3. Perform Update
-    result = await restaurant_collection.update_one(
-        {
-            "restaurant_id": restaurant_id,
-            "menu.name": original_name  # <--- FIND the specific item
-        },
-        {
-            "$set": set_fields
-        }
-    )
-
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Item not found or no changes made")
-
-    return {"status": "success", "message": f"Updated {original_name}"}
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     """
-    This function is the GATEKEEPER.
-    It takes the token from the request, decodes it, finds the user in DB, 
-    and returns the user object. If anything fails, it throws 401.
+    Decodes the token and retrieves the current user + their restaurant_id
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -156,20 +121,44 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 @app.post("/signup")
 async def signup(user: UserSignup):
-    # Check if user already exists
+    # 1. Check if Username exists
     existing_user = await user_collection.find_one({"username": user.username})
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already taken")
-    
-    # Hash password and save
+
+    # 2. Check if Restaurant ID exists
+    existing_restaurant = await restaurant_collection.find_one({"restaurant_id": user.restaurant_id})
+    if existing_restaurant:
+        raise HTTPException(status_code=400, detail="Restaurant ID already taken. Please choose another.")
+
+    # 3. Create the User (and link the restaurant_id to them)
     hashed_pwd = get_password_hash(user.password)
-    new_user = {"username": user.username, "hashed_password": hashed_pwd}
-    await user_collection.insert_one(new_user)
+    new_user = {
+        "username": user.username, 
+        "hashed_password": hashed_pwd,
+        "restaurant_id": user.restaurant_id  # <--- LINKED FOREVER
+    }
+    insert_result = await user_collection.insert_one(new_user)
+    user_db_id = insert_result.inserted_id
+
+    # 4. Create the Empty Restaurant Menu
+    new_restaurant = {
+        "restaurant_id": user.restaurant_id,
+        "name": user.restaurant_name,
+        "owner_id": str(user_db_id),
+        "menu": [],
+        "created_at": datetime.utcnow(),
+        "last_updated": datetime.utcnow()
+    }
+    await restaurant_collection.insert_one(new_restaurant)
     
-    return {"message": "User created successfully"}
+    return {
+        "message": "Account created successfully",
+        "restaurant_id": user.restaurant_id
+    }
 
 @app.post("/login")
-async def login(user: UserSignup):
+async def login(user: UserLogin):
     # Find user
     db_user = await user_collection.find_one({"username": user.username})
     if not db_user or not verify_password(user.password, db_user["hashed_password"]):
@@ -179,93 +168,111 @@ async def login(user: UserSignup):
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- PROTECTED RESTAURANT ROUTES ---
+# --- SMART RESTAURANT ROUTES (Auto-detected ID) ---
 
-@app.post("/restaurants/bulk-add-items")
-async def bulk_add_items(
-    payload: BulkAddRequest, 
-    current_user: dict = Depends(get_current_user) # <--- THIS PROTECTS THE ROUTE
-):
-    now = datetime.utcnow()
-    rid = payload.restaurant_id
-    user_id = str(current_user["_id"]) # The ID of the logged-in user
-
-    # 1. CHECK OWNERSHIP
-    # We check if the restaurant exists.
-    existing_restaurant = await restaurant_collection.find_one({"restaurant_id": rid})
-
-    if existing_restaurant:
-        # If it exists, we MUST check if the 'owner_id' matches the current user
-        if existing_restaurant.get("owner_id") != user_id:
-            raise HTTPException(
-                status_code=403, 
-                detail="You do not own this restaurant. Access forbidden."
-            )
+@app.get("/my-menu")
+async def get_my_menu(current_user: dict = Depends(get_current_user)):
+    """
+    Fetch the menu strictly for the logged-in user.
+    """
+    my_restaurant_id = current_user.get("restaurant_id")
     
-    # 2. PREPARE DATA
-    new_items = [item.model_dump() for item in payload.items]
-
-    # 3. UPSERT WITH OWNER ID
-    # If we are creating a NEW restaurant, we set 'owner_id' to the current user
-    update_query = {
-        "$addToSet": {"menu": { "$each": new_items }},
-        "$set": {"last_updated": now},
-        "$setOnInsert": {
-            "restaurant_id": rid,
-            "isActive": True,
-            "created_at": now,
-            "owner_id": user_id  # <--- Bind the restaurant to this user
-        }
-    }
-
-    result = await restaurant_collection.update_one(
-        {"restaurant_id": rid},
-        update_query,
-        upsert=True
-    )
-
-    return {
-        "status": "success", 
-        "owner": current_user["username"],
-        "items_added": len(new_items)
-    }
-
-@app.get("/restaurants/{restaurant_id}/menu")
-async def get_menu(
-    restaurant_id: str, 
-    current_user: dict = Depends(get_current_user) # <--- PROTECTS READ ACCESS TOO
-):
-    restaurant = await restaurant_collection.find_one({"restaurant_id": restaurant_id})
+    restaurant = await restaurant_collection.find_one({"restaurant_id": my_restaurant_id})
     
     if not restaurant:
-        raise HTTPException(status_code=404, detail="Restaurant not found")
-        
-    # OPTIONAL: Uncomment this if you want ONLY the owner to see the menu
-    # if restaurant.get("owner_id") != str(current_user["_id"]):
-    #     raise HTTPException(status_code=403, detail="Not authorized to view this menu")
+        # Should not happen if signup worked, but just in case
+        return {"menu": []}
 
     return {
-        "restaurant_id": restaurant_id,
+        "restaurant_name": restaurant.get("name"),
+        "restaurant_id": my_restaurant_id,
         "menu": restaurant.get("menu", [])
     }
 
-@app.post("/restaurants/save-bill")
+@app.post("/my-menu/add")
+async def add_menu_items(
+    payload: BulkAddRequest, 
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Adds items to the logged-in user's menu.
+    """
+    my_restaurant_id = current_user.get("restaurant_id")
+    
+    # Prepare data
+    new_items = [item.model_dump() for item in payload.items]
+
+    # Update DB
+    result = await restaurant_collection.update_one(
+        {"restaurant_id": my_restaurant_id}, 
+        {
+            "$push": {"menu": {"$each": new_items}},
+            "$set": {"last_updated": datetime.utcnow()}
+        }
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Restaurant not found")
+
+    return {
+        "status": "success", 
+        "restaurant_id": my_restaurant_id,
+        "items_added": len(new_items)
+    }
+
+@app.put("/my-menu/items/{original_name}")
+async def update_menu_item(
+    original_name: str, 
+    update_data: UpdateItemRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Updates a specific item in the user's menu.
+    """
+    my_restaurant_id = current_user.get("restaurant_id")
+    
+    set_fields = {"last_updated": datetime.utcnow()}
+    
+    if update_data.new_price is not None:
+        set_fields["menu.$.price"] = update_data.new_price
+        
+    if update_data.new_name is not None:
+        set_fields["menu.$.name"] = update_data.new_name
+
+    result = await restaurant_collection.update_one(
+        {
+            "restaurant_id": my_restaurant_id,
+            "menu.name": original_name
+        },
+        {
+            "$set": set_fields
+        }
+    )
+
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return {"status": "success", "message": f"Updated {original_name}"}
+
+@app.post("/bills/save")
 async def save_bill(bill: SaveBillRequest, current_user: dict = Depends(get_current_user)):
     """
-    Saves a completed bill to the database.
+    Saves a bill and tags it with the user's restaurant ID.
     """
+    my_restaurant_id = current_user.get("restaurant_id")
+
     bill_data = bill.model_dump()
-    bill_data["created_at"] = datetime.utcnow()
+    bill_data["restaurant_id"] = my_restaurant_id
     bill_data["owner_id"] = str(current_user["_id"])
+    bill_data["created_at"] = datetime.utcnow()
     
-    # Store in a new collection 'bills'
-    new_bill = await db.get_collection("bills").insert_one(bill_data)
+    new_bill = await bill_collection.insert_one(bill_data)
     
     return {
         "status": "success", 
-        "bill_id": str(new_bill.inserted_id),
-        "message": "Bill saved to history"
+        "bill_id": str(new_bill.inserted_id)
     }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
