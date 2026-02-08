@@ -272,7 +272,42 @@ async def save_bill(bill: SaveBillRequest, current_user: dict = Depends(get_curr
         "status": "success", 
         "bill_id": str(new_bill.inserted_id)
     }
+@app.get("/my-bills")
+async def get_my_bills(
+    date: str, # Format: YYYY-MM-DD
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Fetch bills for the logged-in user for a specific date.
+    """
+    my_owner_id = str(current_user["_id"])
+    
+    # 1. Parse the date string to a datetime object
+    try:
+        query_date = datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
+    # 2. Create Start and End of that day
+    start_of_day = query_date
+    end_of_day = query_date + timedelta(days=1)
+
+    # 3. Query MongoDB for bills in that time range
+    bills_cursor = bill_collection.find({
+        "owner_id": my_owner_id,
+        "created_at": {
+            "$gte": start_of_day,
+            "$lt": end_of_day
+        }
+    }).sort("created_at", -1) # Newest first
+
+    bills = await bills_cursor.to_list(length=100)
+    
+    # Convert ObjectIds to strings for JSON
+    for bill in bills:
+        bill["_id"] = str(bill["_id"])
+        
+    return {"bills": bills}
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
